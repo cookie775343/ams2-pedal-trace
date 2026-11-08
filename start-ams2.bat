@@ -61,4 +61,4 @@ echo Waiting for relay...
 ping -n 6 127.0.0.1 >nul 2>&1
 netstat -ano | find "15608" | find "LISTENING" >nul 2>&1
 if errorlevel 1 (echo Relay did not start. pause & exit /b 1)
-start "" "http://localhost:15608/?mode=%mode%"
+start "" chrome --app="http://localhost:15608/?mode=%mode%"
