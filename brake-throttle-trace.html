@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AMS2 Brake &amp; Throttle Trace</title>
+<style>
+:root { --bg: #111; --panel: #1a1a1a; --grid: #333; --throttle: #2ecc40; --brake: #ff4136;
+  --accent: #0074d9; --text: #eee; --muted: #888; --warn: #ffdc00; }
+html, body { background: transparent !important; margin: 0; padding: 0; box-sizing: border-box; }
+body { color: var(--text); font: 13px/1.4 'Segoe UI', system-ui, sans-serif; overflow: hidden; height: 100vh; display: flex; align-items: center; justify-content: center; }
+#wrapper { width: 800px; height: 300px; display: flex; flex-direction: column; border-radius: 6px; overflow: hidden; border: 1px solid rgba(51,51,51,0.6); background: rgba(17,17,17,0.5); backdrop-filter: blur(8px); }
+#topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 12px; background: rgba(26,26,26,0.7); border-bottom: 1px solid rgba(51,51,51,0.5); flex-shrink: 0; }
+#topbar h1 { font-size: 14px; font-weight: 600; white-space: nowrap; }
+.stat { font-variant-numeric: tabular-nums; min-width: 70px; }
+.stat b { font-size: 16px; }
+.stat small { color: var(--muted); }
+#status { margin-left: auto; font-size: 12px; }
+.ok { color: var(--throttle); }
+.bad { color: var(--brake); }
+#main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+canvas { flex: 1; display: block; min-height: 0; }
+#controls { display: flex; gap: 10px; padding: 6px 12px; background: rgba(26,26,26,0.7); border-top: 1px solid rgba(51,51,51,0.5); flex-shrink: 0; align-items: center; font-size: 12px; }
+#controls label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+#controls input[type=range] { width: 80px; }
+#controls button { background: #444; color: #eee; border: none; padding: 3px 10px; border-radius: 3px; cursor: pointer; }
+#controls button:hover { background: #555; }
+.val { min-width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="wrapper">
+<div id="main">
+  <canvas id="trace"></canvas>
+</div>
+<div id="stats" style="display:flex;gap:16px;padding:6px 12px;background:rgba(26,26,26,0.5);border-top:1px solid rgba(51,51,51,0.5);flex-shrink:0;justify-content:center;">
+  <div class="stat"><b id="vSpeed">0</b> <small>km/h</small></div>
+  <div class="stat"><b id="vGear">N</b> <small>GEAR</small></div>
+  <div class="stat"><b id="vRpm">0</b> <small>RPM</small></div>
+  <div class="stat"><b id="vThrottle">0</b> <small>% THR</small></div>
+  <div class="stat"><b id="vBrake">0</b> <small>% BRK</small></div>
+</div>
+<div id="topbar">
+  <h1>🏎 Brake &amp; Throttle Trace</h1>
+  <span id="status" class="bad">● Disconnected</span>
+</div>
+<div id="controls">
+  <label>W <input type="number" id="inW" value="800" min="300" max="1920" style="width:55px"> H <input type="number" id="inH" value="300" min="150" max="1080" style="width:55px"> <input type="checkbox" id="chkSize" checked title="Reset 800x300">800</label>
+  <label>Grid <input type="checkbox" id="chkGrid" checked></label>
+  <label>Fill <input type="checkbox" id="chkFill"></label>
+  <label>Sim <input type="checkbox" id="chkSim"></label>
+  <button id="btnClear">Clear</button>
+  <button id="btnPng">Export PNG</button>
+  <label>Window <input type="range" id="rWin" min="3" max="60" value="15"><span class="val" id="vWin">15s</span></label>
+  <label>Scroll <input type="range" id="rScroll" min="0.5" max="10" step="0.5" value="2"><span class="val" id="vScroll">2x</span></label>
+</div>
+</div>
+<script>
+const canvas = document.getElementById('trace');
+const ctx = canvas.getContext('2d');
+const DPR = window.devicePixelRatio || 1;
+let W, H;
+
+// Data ring buffer
+let winSec = 15, scrollRate = 2;
+let points = [];       // {t, thr, brk}
+let timeOffset = 0;    // virtual time of oldest visible point
+let startTime = null;
+let showGrid = true;
+let showFill = false;
+
+// Resize
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = r.width * DPR;
+  canvas.height = r.height * DPR;
+  W = canvas.width; H = canvas.height;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Drawing
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const cw = canvas.getBoundingClientRect().width;
+  const ch = canvas.getBoundingClientRect().height;
+
+  // Background
+  ctx.fillStyle = 'rgba(13,13,13,0.4)';
+  ctx.fillRect(0, 0, cw, ch);
+
+  // Grid
+  if (showGrid) {
+    ctx.strokeStyle = 'rgba(40,40,40,0.4)';
+    ctx.lineWidth = 1;
+    for (let y = 0; y <= ch; y += ch / 10) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cw, y); ctx.stroke();
+    }
+  }
+
+  if (points.length < 2) { requestAnimationFrame(draw); return; }
+
+  // Visible time range
+  const now = timeOffset + winSec;
+  const pad = { l: 36, r: 12, t: 8, b: 24 };
+  const gw = cw - pad.l - pad.r;
+  const gh = ch - pad.t - pad.b;
+
+  function xFor(t) { return pad.l + ((t - timeOffset) / winSec) * gw; }
+  function yFor(v) { return pad.t + gh - (v / 100) * gh; }
+
+  // Y-axis labels
+  ctx.fillStyle = '#666';
+  ctx.font = '11px system-ui';
+  ctx.textAlign = 'right';
+  for (let pct = 0; pct <= 100; pct += 25) {
+    const y = yFor(pct);
+    ctx.fillText(pct + '%', pad.l - 4, y + 4);
+    if (showGrid) {
+      ctx.strokeStyle = 'rgba(30,30,30,0.4)';
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(cw - pad.r, y); ctx.stroke();
+    }
+  }
+
+  // X-axis labels (seconds ago)
+  ctx.textAlign = 'center';
+  const step = winSec <= 5 ? 1 : winSec <= 15 ? 2 : 5;
+  for (let s = 0; s <= winSec; s += step) {
+    const t = timeOffset + s;
+    const x = xFor(t);
+    ctx.fillText(s + 's', x, ch - 4);
+    if (showGrid) {
+      ctx.strokeStyle = 'rgba(30,30,30,0.4)';
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, ch - pad.b); ctx.stroke();
+    }
+  }
+
+  // Clip to graph area
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pad.l, pad.t, gw, gh);
+  ctx.clip();
+
+  // Draw trace lines
+  function drawLine(key, color, width, fillAlpha) {
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      if (p.t < timeOffset || p.t > now) continue;
+      const x = xFor(p.t);
+      const y = yFor(p[key]);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    // Fill area
+    if (fillAlpha) {
+      const last = points[points.length - 1];
+      ctx.lineTo(xFor(last.t), yFor(0));
+      const firstVisible = points.find(p => p.t >= timeOffset);
+      if (firstVisible) ctx.lineTo(xFor(firstVisible.t), yFor(0));
+      ctx.closePath();
+      ctx.fillStyle = fillAlpha;
+      ctx.fill();
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+
+  drawLine('thr', '#2ecc40', 2.5, showFill ? 'rgba(46,204,64,0.08)' : null);
+  drawLine('brk', '#ff4136', 2.5, showFill ? 'rgba(255,65,54,0.08)' : null);
+
+  // Current position dot
+  const last = points[points.length - 1];
+  if (last.t >= timeOffset && last.t <= now) {
+    // Throttle dot
+    ctx.beginPath();
+    ctx.arc(xFor(last.t), yFor(last.thr), 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#2ecc40'; ctx.fill();
+    // Brake dot
+    ctx.beginPath();
+    ctx.arc(xFor(last.t), yFor(last.brk), 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff4136'; ctx.fill();
+  }
+
+  ctx.restore();
+
+  // Legend
+  ctx.font = '12px system-ui';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#2ecc40';
+  ctx.fillRect(pad.l + 4, pad.t + 4, 12, 3);
+  ctx.fillText('Throttle', pad.l + 20, pad.t + 10);
+  ctx.fillStyle = '#ff4136';
+  ctx.fillRect(pad.l + 100, pad.t + 4, 12, 3);
+  ctx.fillText('Brake', pad.l + 116, pad.t + 10);
+
+  requestAnimationFrame(draw);
+}
+
+// Auto-scroll
+function advanceTime(dt) {
+  timeOffset += dt * scrollRate;
+  // Keep visible window within data range
+  if (points.length > 0) {
+    const newest = points[points.length - 1].t;
+    const oldest = points[0].t;
+    if (timeOffset + winSec > newest) timeOffset = newest - winSec;
+    if (timeOffset < oldest) timeOffset = oldest;
+  }
+}
+
+let lastFrame = performance.now();
+function loop() {
+  const now = performance.now();
+  const dt = (now - lastFrame) / 1000;
+  lastFrame = now;
+  advanceTime(dt);
+  requestAnimationFrame(loop);
+}
+
+const PORT = 15608;
+// SSE
+let es = null;
+let simMode = false;
+let simInterval = null;
+
+function stopSim() {
+  if (simInterval) { clearInterval(simInterval); simInterval = null; }
+  simMode = false;
+}
+
+function feedData(d) {
+  try {
+    const t = Date.now() / 1000;
+    if (points.length === 0) {
+      startTime = t;
+      timeOffset = t - winSec;
+    }
+    points.push({ t, thr: d.t, brk: d.b });
+    const cutoff = timeOffset - 2;
+    while (points.length > 0 && points[0].t < cutoff) points.shift();
+    while (points.length > 0 && points[0].t < t - 60) points.shift();
+
+    document.getElementById('vThrottle').textContent = d.t;
+    document.getElementById('vBrake').textContent = d.b;
+    document.getElementById('vSpeed').textContent = d.spd ?? '—';
+    document.getElementById('vRpm').textContent = (d.rpm ?? '—');
+    document.getElementById('vGear').textContent = d.gear > 0 ? d.gear : 'N';
+    document.getElementById('status').textContent = simMode ? '● Simulated' : '● Connected';
+    document.getElementById('status').className = 'ok';
+  } catch {}
+}
+
+function connect() {
+  es = new EventSource(`http://localhost:${PORT}/pedals`);
+  es.onmessage = (e) => {
+    try { feedData(JSON.parse(e.data)); } catch {}
+  };
+}
+
+function startSim() {
+  let phase = 0;
+  let phaseT = 0;
+  let thr = 0, brk = 0, rpm = 800, spd = 0, gear = 0;
+  simInterval = setInterval(() => {
+    phaseT += 0.06;
+    if (phase === 0 && phaseT > 2) { phase = 1; phaseT = 0; gear = 1; }
+    if (phase === 1 && phaseT > 3) { phase = 2; phaseT = 0; }
+    if (phase === 2 && phaseT > 2) { phase = 3; phaseT = 0; }
+    if (phase === 3 && phaseT > 1.5) { phase = 0; phaseT = 0; }
+    if (phase === 0) { thr = Math.min(100, thr + 8); rpm = Math.min(7500, rpm + 600); spd = Math.min(120, spd + 5); gear = Math.min(6, Math.ceil(spd / 20)); }
+    if (phase === 1) { thr = 35 + Math.sin(phaseT * 3) * 5; rpm = 3000 + Math.sin(phaseT * 2) * 300; spd = 110 + Math.sin(phaseT * 1.5) * 8; }
+    if (phase === 2) { thr = Math.max(0, thr - 12); brk = Math.min(90, brk + 15); rpm = Math.max(1200, rpm - 500); spd = Math.max(30, spd - 6); gear = Math.max(1, gear - (phaseT > 1 ? 1 : 0)); }
+    if (phase === 3) { brk = Math.max(0, brk - 10); rpm = Math.max(800, rpm - 200); spd = Math.max(0, spd - 3); gear = 0; thr = 0; }
+    feedData({ t: Math.round(thr), b: Math.round(brk), rpm: Math.round(rpm), spd: Math.round(spd), gear });
+  }, 60);
+  simMode = true;
+}
+
+// Sim toggle
+document.getElementById('chkSim').onchange = function() {
+  if (this.checked) { stopSim(); startSim(); document.getElementById('status').textContent = '● Simulated'; document.getElementById('status').className = 'ok'; }
+  else { stopSim(); document.getElementById('status').textContent = es ? '● Connected' : '● Disconnected'; document.getElementById('status').className = 'bad'; }
+};
+
+// Controls
+document.getElementById('rWin').oninput = function() {
+  winSec = +this.value;
+  document.getElementById('vWin').textContent = winSec + 's';
+};
+document.getElementById('rScroll').oninput = function() {
+  scrollRate = +this.value;
+  document.getElementById('vScroll').textContent = scrollRate + 'x';
+};
+document.getElementById('btnClear').onclick = () => {
+  points = [];
+  startTime = null;
+  timeOffset = 0;
+};
+document.getElementById('btnPng').onclick = () => {
+  const a = document.createElement('a');
+  a.download = 'brake-throttle-trace.png';
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+};
+document.getElementById('chkSize').onchange = function() {
+  const w = document.getElementById('wrapper');
+  if (this.checked) {
+    document.getElementById('inW').value = 800;
+    document.getElementById('inH').value = 300;
+    w.style.width = '800px';
+    w.style.height = '300px';
+    localStorage.setItem('ams2_w', '800');
+    localStorage.setItem('ams2_h', '300');
+  }
+};
+document.getElementById('inW').onchange = function() {
+  document.getElementById('wrapper').style.width = this.value + 'px';
+  document.getElementById('chkSize').checked = false;
+  localStorage.setItem('ams2_w', this.value);
+};
+document.getElementById('inH').onchange = function() {
+  document.getElementById('wrapper').style.height = this.value + 'px';
+  document.getElementById('chkSize').checked = false;
+  localStorage.setItem('ams2_h', this.value);
+};
+
+// Restore size
+(function() {
+  const sw = localStorage.getItem('ams2_w');
+  const sh = localStorage.getItem('ams2_h');
+  if (sw) { document.getElementById('wrapper').style.width = sw + 'px'; document.getElementById('inW').value = sw; }
+  if (sh) { document.getElementById('wrapper').style.height = sh + 'px'; document.getElementById('inH').value = sh; }
+  if (sw !== '800' || sh !== '300') document.getElementById('chkSize').checked = false;
+})();
+// Mode: 1=full, 2=no stats, 3=trace only, 4=stats+trace, 5=trace+infill, 6=stats+trace+infill
+(function() {
+  const p = new URLSearchParams(window.location.search);
+  const mode = p.get('mode');
+  const w = document.getElementById('wrapper');
+  if (mode === '2') {
+    document.getElementById('stats').style.display = 'none';
+    w.style.height = '240px';
+  } else if (mode === '3') {
+    document.getElementById('stats').style.display = 'none';
+    document.getElementById('topbar').style.display = 'none';
+    document.getElementById('controls').style.display = 'none';
+    w.style.height = '180px';
+  } else if (mode === '4') {
+    document.getElementById('topbar').style.display = 'none';
+    document.getElementById('controls').style.display = 'none';
+    w.style.height = '200px';
+  } else if (mode === '5') {
+    document.getElementById('stats').style.display = 'none';
+    document.getElementById('topbar').style.display = 'none';
+    document.getElementById('controls').style.display = 'none';
+    w.style.height = '180px';
+    showFill = true;
+    document.getElementById('chkFill').checked = true;
+  } else if (mode === '6') {
+    document.getElementById('topbar').style.display = 'none';
+    document.getElementById('controls').style.display = 'none';
+    w.style.height = '200px';
+    showFill = true;
+    document.getElementById('chkFill').checked = true;
+  }
+  setTimeout(function() { window.dispatchEvent(new Event('resize')); }, 50);
+})();
+
+document.getElementById('chkGrid').onchange = function() { showGrid = this.checked; };
+document.getElementById('chkFill').onchange = function() { showFill = this.checked; };
+
+connect();
+requestAnimationFrame(draw);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
